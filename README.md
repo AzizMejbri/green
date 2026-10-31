@@ -170,6 +170,52 @@ how many requests can be queued through `ring_submit` before the io_uring
 submission queue fills; the scheduler path drains between submissions, so it is
 not limited by that queue depth.
 
+### Measured 1 GiB boundaries
+
+On a machine with a 1 GiB address-space cap (`ulimit -v 1048576`), `just limits`
+found these boundaries:
+
+| Probe | Last success | First failure | Cause |
+| --- | ---: | ---: | --- |
+| `fibers` | 84,928 | 84,929 | stack `mmap` OOM |
+| `channels` | 42,368 pairs | 42,369 pairs | wait-queue allocation OOM |
+| `requests` | 84,304 | 84,305 | scheduler run-queue OOM under memory pressure |
+| `ring` | 29,695,742 slots | 29,695,743 slots | slot allocation `ENOMEM` |
+| `burst` | 31 queued | 32 | io_uring SQ depth |
+
+Reproduce with:
+
+```bash
+just limits
+(ulimit -v 1048576; ./build/limits fibers 84928)
+(ulimit -v 1048576; ./build/limits channels 42368)
+(ulimit -v 1048576; ./build/limits requests 84304 5000000000)
+(ulimit -v 1048576; ./build/limits ring 29695742)
+./build/limits burst 31
+```
+
+Why these are the boundaries:
+
+- **Fibers:** each fiber reserves 8 KiB of usable stack plus a 4 KiB guard
+  page, or 12 KiB of address space. 84,928 × 12 KiB is about 995 MiB, roughly
+  97% of the 1 GiB cap; the next stack `mmap` fails.
+- **Channels:** each pair is two fibers. 42,368 pairs is 84,736 fibers, only
+  192 below the fiber boundary; the remaining memory goes to channel wait-queue
+  nodes.
+- **Requests:** each blocked timeout also owns a fiber, a request slot, and
+  scheduler bookkeeping. 84,304 is 624 below the fiber boundary; the next run
+  fails in the scheduler's idle-wake path when it cannot grow the run queue.
+- **Ring slots:** each slot costs roughly 36 bytes including its free-list
+  entry, so 29,695,742 slots consume about 1 GiB; the next slot allocation
+  returns `ENOMEM`.
+- **Burst:** `ring_submit` can queue 31 operations because the io_uring
+  submission queue has 32 entries and `get_sqe` reserves one for linked
+  operations. The scheduler drains between submissions, so normal blocked I/O
+  is not capped at 31.
+
+These are memory and resource boundaries for this machine and kernel, not fixed
+runtime limits. Exact values vary with the allocator, kernel, and workload.
+
 ## Runtime model
 
 - One scheduler thread owns the `io_uring` ring and all fibers.
